@@ -1,0 +1,12 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --no-cache
+      - --pull
+      - --tag
+      - gcr.io/$PROJECT_ID/notion-reader:$COMMIT_SHA
+      - .
+
+images:
+  - gcr.io/$PROJECT_ID/notion-reader:$COMMIT_SHA
