@@ -1,0 +1,18 @@
+{
+  "name": "notion-lesson-reader",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal published Notion lesson reader for Cloud Run",
+  "type": "module",
+  "engines": {
+    "node": ">=22 <27"
+  },
+  "scripts": {
+    "start": "node src/main.js",
+    "test": "node --test --test-reporter=spec test/*.test.js",
+    "check": "for file in src/*.js; do node --check \"$file\" || exit 1; done"
+  },
+  "dependencies": {
+    "@google-cloud/storage": "8.4.0"
+  }
+}
