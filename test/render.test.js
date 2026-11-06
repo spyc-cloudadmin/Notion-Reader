@@ -73,3 +73,12 @@ test('public IP validation rejects loopback, private, link-local, and IPv4-mappe
   assert.equal(isPublicAddress('8.8.8.8'), true);
   assert.equal(isPublicAddress('2606:4700:4700::1111'), true);
 });
+
+test('allowlisted child pages become local links without crawling other child pages', () => {
+  const html = renderBlocks([
+    { id: PAGE_ID, type: 'child_page', child_page: { title: 'Allowlisted child' } },
+    { id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', type: 'child_page', child_page: { title: 'Other child' } },
+  ], { config: testConfig() });
+  assert.match(html, /<a href="\/lessons\/lesson-one">Allowlisted child<\/a>/);
+  assert.match(html, /Child page not published: Other child/);
+});

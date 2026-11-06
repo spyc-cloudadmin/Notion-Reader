@@ -47,6 +47,19 @@ function routeName(pathname) {
   return 'not_found';
 }
 
+async function resolveLesson(config, store, slug) {
+  const configured = config.bySlug.get(slug);
+  if (configured) {
+    return { lesson: configured, current: await store.readJson(paths.current(slug)) };
+  }
+  for (const root of config.lessons) {
+    const current = await store.readJson(paths.current(root.slug));
+    const lesson = current?.pages?.find((page) => page.slug === slug);
+    if (lesson) return { lesson, current };
+  }
+  return null;
+}
+
 export function createApplication({ config, store, publisher, stylesheet = '', logger = console }) {
   return http.createServer(async (request, response) => {
     const requestId = randomUUID();
@@ -69,18 +82,13 @@ export function createApplication({ config, store, publisher, stylesheet = '', l
         });
       } else if (request.method === 'GET' && /^\/lessons\/[^/]+$/.test(pathname)) {
         const slug = decodeURIComponent(pathname.slice('/lessons/'.length));
-        const lesson = config.bySlug.get(slug);
-        if (!lesson) {
+        const resolved = await resolveLesson(config, store, slug);
+        if (!resolved?.current || typeof resolved.current.version !== 'string') {
           status = 404;
           sendHtml(response, status, renderUnavailable());
           return;
         }
-        const current = await store.readJson(paths.current(slug));
-        if (!current || typeof current.version !== 'string') {
-          status = 404;
-          sendHtml(response, status, renderUnavailable());
-          return;
-        }
+        const { current } = resolved;
         status = 200;
         response.setHeader('ETag', `"${current.version}"`);
         if (request.headers['if-none-match'] === `"${current.version}"`) {
@@ -99,7 +107,8 @@ export function createApplication({ config, store, publisher, stylesheet = '', l
         sendHtml(response, status, snapshot, 'public, max-age=0, must-revalidate');
       } else if (request.method === 'GET' && pathname.startsWith('/assets/')) {
         const match = pathname.match(/^\/assets\/([a-z0-9-]+)\/([0-9a-f]{8}-[0-9a-f-]{27})\/([a-f0-9]{24}\.[a-z0-9]+)$/);
-        if (!match || !config.bySlug.has(match[1])) {
+        const resolved = match ? await resolveLesson(config, store, match[1]) : null;
+        if (!resolved?.current) {
           status = 404;
           sendJson(response, status, { error: 'Asset not found' });
           return;

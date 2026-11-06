@@ -1,36 +1,40 @@
 # Notion lesson reader
 
-A small, read-only publishing service for selected Notion lessons. It uses one Node.js Cloud Run service, one private Cloud Storage bucket, and two Secret Manager secrets. Students never trigger Notion API requests.
+A small, read-only publishing service for selected Notion lesson trees. It uses one Node.js Cloud Run service, one private Cloud Storage bucket, and two Secret Manager secrets. Student routes only read storage; optional cold-start refreshes call Notion separately from those routes.
 
-**Published lessons are public.** A hard-to-guess URL is not access control. Source Notion permissions do not carry over to this website. Publish only non-sensitive material with no student information. If school-only access is needed later, add it as a separate, designed phase rather than treating the publish token as student authentication.
+**Published lessons are public.** A hard-to-guess URL is not access control. Source Notion permissions do not carry over to this website. Publish only non-sensitive material with no student information. Recursive mode publishes every descendant child page beneath an approved root, so review the entire tree. If school-only access is needed later, add it as a separate, designed phase rather than treating the publish token as student authentication.
 
 ## Architecture and storage
 
-- `GET /` lists the configured allowlist.
-- `GET /lessons/:slug` reads the current pointer and its completed HTML snapshot.
+- `GET /` lists the configured allowlisted roots.
+- `GET /lessons/:slug` reads the applicable root pointer and its completed HTML snapshot.
 - `GET /assets/:slug/:version/:filename` serves a mirrored asset from the same bucket.
-- `POST /admin/publish/:slug` synchronously publishes one allowlisted lesson.
+- `POST /admin/publish/:slug` synchronously publishes one allowlisted root or tree.
 - `GET /healthz` checks the application only; it does not call Notion or storage.
 - `GET /style.css` serves the stylesheet.
 
-For each lesson, objects have this layout:
+For each root and discovered descendant, objects have this layout:
 
 ```text
-lessons/<slug>/current.json
-lessons/<slug>/publish-lock.json                 # present only during a publish
-lessons/<slug>/versions/<publish-id>/index.html
-lessons/<slug>/versions/<publish-id>/assets/...
+lessons/<root-slug>/current.json                  # root pointer and discovered page manifest
+lessons/<root-slug>/publish-lock.json             # present only during a publish
+lessons/<page-slug>/versions/<publish-id>/index.html
+lessons/<page-slug>/versions/<publish-id>/assets/...
 ```
 
-A publish fetches the page and recursively fetches block children with cursor pagination. Requests are serialized and retries are bounded. Notion `429`/`529` responses honor `Retry-After`; transient idempotent request failures also have bounded retries. The app mirrors images/files, renders escaped HTML, writes the complete version, then changes `current.json` using a storage generation precondition. Notion errors, content-limit errors, and storage failures leave the previous current version untouched. Failed downloads instead produce visible placeholders and a successful response with a warning count.
+A publish fetches each page and recursively fetches block children with cursor pagination. With `RECURSIVE_PUBLISH=true`, only actual `child_page` descendants are discovered; links, mentions, and linked pages are not followed. Descendant slugs combine a readable title with a short page-ID suffix. All tree snapshots and assets are written before the root's `current.json` pointer changes using a storage generation precondition.
 
-A storage precondition creates an expiring per-lesson lock. Only one publisher can hold it. Version IDs make snapshots and assets immutable. Incomplete old versions may remain after failures; they are not public through `current.json`, but still consume storage until manually removed.
+Requests are serialized and retries are bounded. Notion `429`/`529` responses honor `Retry-After`; transient idempotent request failures also have bounded retries. Notion errors, content-limit errors, and storage failures leave the previous current tree untouched. Failed downloads instead produce visible placeholders and a successful response with a warning count.
+
+A storage precondition creates an expiring per-root lock. Only one publisher can hold it. Version IDs make snapshots and assets immutable. Incomplete old versions may remain after failures; they are not public through `current.json`, but still consume storage until manually removed.
+
+With `REFRESH_ON_START=true`, every new Cloud Run instance refreshes each configured root in the background after the HTTP server starts. Students receive existing snapshots while this happens. Cold starts can therefore indirectly cause Notion calls and publishing charges. Enable always-allocated CPU for reliable background completion; otherwise CPU throttling can pause work when no request is active. This is not a periodic scheduler: warm instances do not refresh until a manual publish or a later cold start.
 
 ## Supported content
 
 Paragraphs, text formatting, headings, bulleted/numbered lists, read-only to-dos, code with a language label, quotes, dividers, callouts, toggles, tables, images, files, and PDFs are supported. Mentions of allowlisted pages become local lesson links. Standard Notion links containing an allowlisted page ID are also recognized on a best-effort basis; Notion does not guarantee its URL formats. Other HTTP(S) links are labelled external and open in a new tab.
 
-Unsupported blocks produce a visible placeholder and structured log. Child and linked pages are never crawled. Embeds, bookmarks, audio, and video are rendered as external links rather than loaded third-party content. Consequently, ordinary student page loads have no third-party dependency; following an external link is the student's choice.
+Unsupported blocks produce a visible placeholder and structured log. Discovered child pages become local links; non-allowlisted child pages remain placeholders when recursive mode is off. Linked pages are never crawled. Embeds, bookmarks, audio, and video are rendered as external links rather than loaded third-party content. Consequently, ordinary student page loads have no third-party dependency; following an external link is the student's choice.
 
 The runtime uses Node.js 24 and Notion API version `2026-03-11`. References checked during implementation:
 
@@ -142,10 +146,10 @@ export LESSONS_JSON="$(tr -d '\n' < lessons.json)"
 gcloud run deploy "${SERVICE}" \
   --source . --region="${REGION}" \
   --service-account="${SA_EMAIL}" --allow-unauthenticated \
-  --set-env-vars="^@^GCS_BUCKET=${BUCKET}@LESSONS_JSON=${LESSONS_JSON}" \
+  --set-env-vars="^@^GCS_BUCKET=${BUCKET}@LESSONS_JSON=${LESSONS_JSON}@RECURSIVE_PUBLISH=true@REFRESH_ON_START=true" \
   --set-secrets="NOTION_TOKEN=notion-token:latest,ADMIN_TOKEN=admin-publish:latest" \
   --min-instances=0 --max-instances=3 --concurrency=20 \
-  --cpu=1 --memory=256Mi --timeout=300
+  --cpu=1 --memory=256Mi --timeout=300 --no-cpu-throttling
 
 export SERVICE_URL="$(gcloud run services describe "${SERVICE}" \
   --region="${REGION}" --format='value(status.url)')"
@@ -154,7 +158,7 @@ curl "${SERVICE_URL}/healthz"
 
 The alternate `@` delimiter prevents commas in JSON from being interpreted as multiple environment assignments. Avoid `@` in lesson titles or choose a different delimiter using the same `gcloud` escaping syntax. Updating the allowlist requires redeploying the service configuration.
 
-`--allow-unauthenticated` is intentional because published lessons are public. `--max-instances=3` bounds concurrent instances and potential cost, but excess traffic can be queued/throttled and publish requests may contend for CPU. Raise it only if measured demand requires it. Scale-to-zero can cause cold starts.
+`--allow-unauthenticated` is intentional because published lessons are public. `--max-instances=3` bounds concurrent instances and potential cost, but excess traffic can be queued/throttled and publish requests may contend for CPU. Raise it only if measured demand requires it. Scale-to-zero can cause cold starts. `--no-cpu-throttling` allows cold-start publication to continue without an active request and can increase charges; omit it and set `REFRESH_ON_START=false` if background refresh is not wanted.
 
 ### Publish and read
 
@@ -164,13 +168,13 @@ curl --fail-with-body -X POST \
   "${SERVICE_URL}/admin/publish/fractions-intro"
 ```
 
-Then open `${SERVICE_URL}/lessons/fractions-intro`. Editing Notion changes nothing until this command succeeds. Reuse the command to refresh a lesson. Do not send the admin token to students, put it in browser code, or include it in URLs.
+Then open `${SERVICE_URL}/lessons/fractions-intro`. With recursive mode enabled, the response's `pages` count includes all discovered descendants. Editing Notion changes the public site after a manual publish or the next enabled cold-start refresh. Do not send the admin token to students, put it in browser code, or include it in URLs.
 
 ## Limits and security behavior
 
-Defaults: 1,000 blocks, nesting depth 32, 2 MB rendered HTML, 10 MB per asset, 50 MB total mirrored assets, 10 seconds per asset download attempt, three redirects, and a 240-second application publication deadline. Cloud Run is configured with a 300-second request timeout and a 300-second lock TTL. `LOCK_TTL_MS` must remain safely greater than `PUBLISH_TIMEOUT_MS`.
+Defaults: 50 pages per recursive tree, tree depth 8, 1,000 blocks per page, nested block depth 32, 2 MB rendered HTML per page, 10 MB per asset, 50 MB total mirrored assets per tree, 10 seconds per asset download attempt, three redirects, and a 240-second application publication deadline per root. `MAX_TREE_PAGES` and `MAX_TREE_DEPTH` can lower or raise the tree bounds within the application's hard maxima. Cloud Run is configured with a 300-second request timeout and a 300-second lock TTL. `LOCK_TTL_MS` must remain safely greater than `PUBLISH_TIMEOUT_MS`.
 
-A large lesson may not fit a synchronous request. Split it into smaller allowlisted lessons or adjust the bounded settings within the configured request timeout. If reliable publication genuinely needs longer work, that is a separate architectural phase requiring an asynchronous job design; no scheduler or queue is hidden in this MVP.
+A large lesson tree may not fit a synchronous request or cold-start publication window. Split it into smaller allowlisted roots or adjust the bounded settings within the configured request timeout. If reliable publication genuinely needs longer work, that is a separate architectural phase requiring an asynchronous job design; no scheduler or queue is hidden in this app.
 
 Assets require HTTPS and an exact hostname in `ASSET_ALLOWED_HOSTS` (comma-separated). Defaults cover common Notion file hosts. For example, external Unsplash images remain unavailable unless `images.unsplash.com` is explicitly added. Every redirect is revalidated. DNS results are checked and the connection is pinned to a validated public IP to reduce DNS-rebinding/SSRF risk. Private, loopback, link-local, and other non-public addresses are rejected.
 
@@ -187,7 +191,7 @@ npm test
 npm run check
 ```
 
-The suite makes real HTTP requests to a local server with in-memory storage and a scripted Notion API. It covers rendering/escaping, safe URLs and IPs, authentication, unknown slugs, rate-limit retry behavior, pagination and nested blocks, local mirrored images, zero Notion calls during repeated/concurrent student visits, edit-before-republish isolation, successful updates, failed-publish rollback, restart persistence, ETag revalidation, and competing publish requests.
+The suite makes real HTTP requests to a local server with in-memory storage and a scripted Notion API. It covers rendering/escaping, safe URLs and IPs, authentication, unknown slugs, rate-limit retry behavior, pagination and nested blocks, recursive descendant discovery, dynamic child routes/assets, cold-start refreshes, local mirrored images, zero Notion calls during repeated/concurrent student visits, edit-before-republish isolation, successful updates, failed-publish rollback, restart persistence, ETag revalidation, and competing publish requests.
 
 For a deployed smoke test:
 

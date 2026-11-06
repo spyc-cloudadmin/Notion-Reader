@@ -14,6 +14,12 @@ function integer(value, fallback, minimum, maximum) {
   return parsed;
 }
 
+function boolean(value, fallback = false) {
+  if (value === undefined) return fallback;
+  if (!['true', 'false'].includes(value)) throw new Error('Expected true or false');
+  return value === 'true';
+}
+
 function normalizePageId(value) {
   if (typeof value !== 'string') return null;
   const compact = value.toLowerCase().replaceAll('-', '');
@@ -86,6 +92,10 @@ export async function loadConfig(env = process.env) {
     notionVersion: '2026-03-11',
     publishTimeoutMs,
     lockTtlMs,
+    recursivePublish: boolean(env.RECURSIVE_PUBLISH),
+    refreshOnStart: boolean(env.REFRESH_ON_START),
+    maxTreePages: integer(env.MAX_TREE_PAGES, 50, 1, 200),
+    maxTreeDepth: integer(env.MAX_TREE_DEPTH, 8, 1, 16),
     maxBlocks: integer(env.MAX_BLOCKS, 1_000, 1, 5_000),
     maxRenderedBytes: integer(env.MAX_RENDERED_BYTES, 2_000_000, 10_000, 10_000_000),
     maxAssetBytes: integer(env.MAX_ASSET_BYTES, 10_000_000, 1_024, 50_000_000),

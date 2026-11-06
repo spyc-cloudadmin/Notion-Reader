@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { Storage } from '@google-cloud/storage';
 import { loadConfig } from './config.js';
+import { startColdStartRefresh } from './lifecycle.js';
 import { NotionClient } from './notion.js';
 import { LessonPublisher } from './publish.js';
 import { createApplication } from './server.js';
@@ -24,6 +25,7 @@ try {
   server.headersTimeout = 15_000;
   server.listen(config.port, '0.0.0.0', () => {
     logger.info({ event: 'server_started', port: config.port });
+    startColdStartRefresh({ config, publisher, logger });
   });
   process.on('SIGTERM', () => {
     logger.info({ event: 'server_stopping' });

@@ -14,6 +14,26 @@ function isPreconditionFailure(error) {
   return error.code === 412 || error.statusCode === 412;
 }
 
+function normalizedPageId(pageId) {
+  return pageId.replaceAll('-', '').toLowerCase();
+}
+
+function descendantSlug(title, pageId) {
+  const base = title.normalize('NFKD').toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+    .slice(0, 55).replace(/-$/g, '') || 'lesson';
+  return `${base}-${normalizedPageId(pageId).slice(0, 8)}`;
+}
+
+function childPages(blocks = []) {
+  const children = [];
+  for (const block of blocks) {
+    if (block.type === 'child_page') children.push({ pageId: block.id, title: block.child_page?.title || 'Untitled lesson' });
+    if (!['child_page', 'link_to_page'].includes(block.type)) children.push(...childPages(block.children));
+  }
+  return children;
+}
+
 export class LessonPublisher {
   constructor(config, store, notion, {
     logger = console,
@@ -92,6 +112,32 @@ export class LessonPublisher {
     }
   }
 
+  async discoverTree(root, deadline) {
+    const pages = [];
+    const byPageId = new Map();
+    const visit = async (lesson, depth) => {
+      if (depth > this.config.maxTreeDepth) {
+        throw new HttpError(413, 'Lesson tree exceeds the depth limit', 'content_limit');
+      }
+      const key = normalizedPageId(lesson.pageId);
+      if (byPageId.has(key)) return;
+      if (pages.length >= this.config.maxTreePages) {
+        throw new HttpError(413, 'Lesson tree exceeds the page limit', 'content_limit');
+      }
+      const entry = depth === 0 ? root : {
+        slug: descendantSlug(lesson.title, lesson.pageId),
+        title: lesson.title,
+        pageId: lesson.pageId,
+      };
+      byPageId.set(key, entry.slug);
+      pages.push(entry);
+      entry.blocks = await this.notion.lesson(entry.pageId, deadline);
+      for (const child of childPages(entry.blocks)) await visit(child, depth + 1);
+    };
+    await visit(root, 0);
+    return { pages, byPageId };
+  }
+
   async switchCurrent(slug, pointer) {
     const path = paths.current(slug);
     const metadata = await this.store.metadata(path);
@@ -112,7 +158,7 @@ export class LessonPublisher {
       error: (entry) => this.logger.error({ ...entry, publishId }),
     };
     const deadline = Date.now() + this.config.publishTimeoutMs;
-    log.info({ event: 'publish_started', slug });
+    log.info({ event: 'publish_started', slug, recursive: this.config.recursivePublish });
     const lock = await this.acquireLock(slug, publishId);
     if (!lock) {
       log.warn({ event: 'publish_rejected_locked', slug });
@@ -120,29 +166,40 @@ export class LessonPublisher {
     }
 
     try {
-      const blocks = await this.notion.lesson(lesson.pageId, deadline);
-      const assets = new Map();
+      const tree = this.config.recursivePublish
+        ? await this.discoverTree(lesson, deadline)
+        : { pages: [{ ...lesson, blocks: await this.notion.lesson(lesson.pageId, deadline) }], byPageId: this.config.byPageId };
+      const renderConfig = {
+        ...this.config,
+        byPageId: new Map([...this.config.byPageId, ...tree.byPageId]),
+      };
       const totals = { bytes: 0, warnings: 0 };
-      await this.mirrorAssets(blocks, slug, publishId, deadline, assets, totals);
       const publishedAt = this.now().toISOString();
-      const html = renderLesson({
-        lesson,
-        blocks,
-        assets,
-        publishedAt,
-        config: this.config,
-        onUnsupported: (type) => log.warn({ event: 'unsupported_block', blockType: type }),
-      });
-      if (Buffer.byteLength(html) > this.config.maxRenderedBytes) {
-        throw new HttpError(413, 'Rendered lesson exceeds the size limit', 'content_limit');
+
+      for (const page of tree.pages) {
+        const assets = new Map();
+        await this.mirrorAssets(page.blocks, page.slug, publishId, deadline, assets, totals);
+        const html = renderLesson({
+          lesson: page,
+          blocks: page.blocks,
+          assets,
+          publishedAt,
+          config: renderConfig,
+          onUnsupported: (type) => log.warn({ event: 'unsupported_block', blockType: type, slug: page.slug }),
+        });
+        if (Buffer.byteLength(html) > this.config.maxRenderedBytes) {
+          throw new HttpError(413, 'Rendered lesson exceeds the size limit', 'content_limit');
+        }
+        await this.store.write(paths.snapshot(page.slug, publishId), html, {
+          contentType: 'text/html; charset=utf-8',
+          cacheControl: 'no-cache',
+        });
       }
-      await this.store.write(paths.snapshot(slug, publishId), html, {
-        contentType: 'text/html; charset=utf-8',
-        cacheControl: 'no-cache',
-      });
-      await this.switchCurrent(slug, { version: publishId, publishedAt });
-      log.info({ event: 'publish_succeeded', slug, version: publishId, warnings: totals.warnings });
-      return { ok: true, slug, version: publishId, publishedAt, warnings: totals.warnings };
+
+      const pages = tree.pages.map(({ slug: pageSlug, title, pageId }) => ({ slug: pageSlug, title, pageId }));
+      await this.switchCurrent(slug, { version: publishId, publishedAt, pages });
+      log.info({ event: 'publish_succeeded', slug, version: publishId, pages: pages.length, warnings: totals.warnings });
+      return { ok: true, slug, version: publishId, publishedAt, pages: pages.length, warnings: totals.warnings };
     } catch (error) {
       log.error({ event: 'publish_failed', slug, code: error.code ?? 'internal_error', status: error.status ?? 500 });
       throw error;

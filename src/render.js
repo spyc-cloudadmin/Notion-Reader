@@ -169,8 +169,12 @@ function renderBlock(block, context) {
         ? `<p><a href="${escapeHtml(local)}">Linked allowlisted lesson</a></p>`
         : placeholder('Linked page is not allowlisted and was not published');
     }
-    case 'child_page':
-      return placeholder(`Child page not published: ${data?.title ?? 'untitled'}`);
+    case 'child_page': {
+      const local = lessonLink(block.id, context);
+      return local
+        ? `<p><a href="${escapeHtml(local)}">${escapeHtml(data?.title ?? 'Linked lesson')}</a></p>`
+        : placeholder(`Child page not published: ${data?.title ?? 'untitled'}`);
+    }
     default:
       return `${unsupported(block, context)}${renderBlocks(block.children, context)}`;
   }
